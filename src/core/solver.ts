@@ -308,7 +308,9 @@ interface Move {
  * space: A minimizes total counter gap; B minimizes midpoint deviation on
  * primary-optimal chains (also choosing s); C greedily fixes the
  * lexicographically smallest id sequence with a memoized feasibility oracle;
- * a final pass selects the pause duration and carrying edge.
+ * D re-opens the counter gaps of the fixed id sequence and selects the pause
+ * duration and carrying edge jointly across every still-tied complete
+ * interpretation.
  *
  * Throws SolveError(NO_CONSISTENT_INTERPRETATION) with first-failure evidence.
  */
@@ -748,7 +750,10 @@ export function solve(
 
     let best = Infinity;
     for (const mv of moves) {
-      if (Number.isFinite(bestA) && S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] >= bestA) break;
+      // Bound-prune per move: the Held-Karp completion bound depends on the
+      // target packet, so a later move with a larger gap but a cheaper
+      // completion may still improve; only this move is skipped.
+      if (Number.isFinite(bestA) && S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] >= bestA) continue;
       used[mv.j] = 1;
       orderArr[depth] = mv.j;
       gapsArr[depth - 1] = mv.d;
@@ -1411,73 +1416,164 @@ export function solve(
     curMask |= 1 << picked.j;
   }
 
-  // Assemble the certified chain: smallest admissible c0.
+  // Assemble the certified chain.
   const finalOrder = chosen.slice();
-  const finalGaps = fixedGaps.slice();
 
-  // Pick the carrying edge and duration. Counts and the id sequence are
-  // fixed; evaluate every edge position and prefer (deviation, duration,
-  // edge index) lexicographically. Without dormancy the edge stays unused.
+  // Select the complete interpretation reported to the caller. Without
+  // dormancy the counter gaps fixed by phase C are already canonical. With
+  // dormancy, distinct counter-gap assignments over the SAME id sequence can
+  // still tie on all three primary objectives while admitting different
+  // pause placements, and the tie-break (shorter pause, then earlier
+  // carrying edge) spans all of them — so the gaps are re-opened and chosen
+  // jointly with the pause.
   let finalEdge = -1;
   let finalS = 0;
   let finalTimes: number[] = [];
   let finalDev = Infinity;
+  let finalGaps: number[];
+  let finalC0: number;
 
   if (dormEnabled) {
-    // Independent forward time windows for the fixed chain (no pause): the
-    // pause onset at edge e starts from packet e's plain tightened window.
-    const fwdLo = new Array<number>(n);
-    const fwdHi = new Array<number>(n);
-    fwdLo[0] = packets[finalOrder[0]].lo;
-    fwdHi[0] = packets[finalOrder[0]].hi;
-    for (let k = 1; k < n; k++) {
-      const p = packets[finalOrder[k]];
-      fwdLo[k] = Math.max(p.lo, fwdLo[k - 1] + finalGaps[k - 1] * minInterval);
-      fwdHi[k] = Math.min(p.hi, fwdHi[k - 1] + finalGaps[k - 1] * maxInterval);
+    // -------------------------------------------------------------- Phase D
+    // Enumerate every primary-optimal counter-gap sequence of the fixed id
+    // order jointly with the placement of the unique pause, minimizing
+    //   (total deviation, pause duration, carrying edge index)
+    // lexicographically over ALL tied complete interpretations. Gap
+    // sequences are visited in ascending order and the first interpretation
+    // reaching the best tuple is kept, which also fixes the reported
+    // absolute counters deterministically.
+    interface DormDecision {
+      dev: number;
+      s: number;
+      edge: number;
+      gaps: number[];
+      c0: number;
+      times: number[];
     }
 
-    for (let e = 0; e < n - 1; e++) {
-      if (fwdLo[e] > fwdHi[e]) continue;
-      const pNext = packets[finalOrder[e + 1]];
-      const d = finalGaps[e];
-      let sA = Math.max(Dlo, pNext.lo - fwdHi[e] - d * maxInterval);
-      let sB = Math.min(Dhi, pNext.hi - fwdLo[e] - d * minInterval);
-      if (sA > sB) continue;
-      let envLo: Env = { P: fwdLo[e] + d * minInterval, Q: pNext.lo, R: 0, T: 0 };
-      let envHi: Env = { P: 0, Q: 0, R: fwdHi[e] + d * maxInterval, T: pNext.hi };
-      let feasible = true;
-      for (let k = e + 2; k < n; k++) {
-        const ext = extendParam(envLo, envHi, sA, sB, finalGaps[k - 1], packets[finalOrder[k]]);
-        if (!ext) {
-          feasible = false;
-          break;
+    const selectDormancyInterpretation = (): DormDecision | null => {
+      let bestD: DormDecision | null = null;
+
+      const dfsD = (
+        depth: number,
+        last: number,
+        S: number,
+        c0lo: number,
+        c0hi: number,
+        fr: Frontier,
+        dormEdge: number,
+        mask: number,
+      ): void => {
+        if (depth === n) {
+          // Admissible leaves placed the unique pause exactly once.
+          if (fr.kind !== 'param' || dormEdge < 0) return;
+          const r = bestLeafDeviation(finalOrder, gapsArr, dormEdge, fr.sLo, fr.sHi);
+          if (r.devInfinity) return;
+          const inc = bestD;
+          if (
+            inc === null ||
+            r.dev < inc.dev ||
+            (r.dev === inc.dev && (r.s < inc.s || (r.s === inc.s && dormEdge < inc.edge)))
+          ) {
+            bestD = {
+              dev: r.dev,
+              s: r.s,
+              edge: dormEdge,
+              gaps: gapsArr.slice(0, n - 1),
+              c0: c0lo,
+              times: r.times,
+            };
+          }
+          return;
         }
-        envLo = ext.envLo;
-        envHi = ext.envHi;
-        sA = ext.sLo;
-        sB = ext.sHi;
-      }
-      if (!feasible) continue;
-      const r = bestLeafDeviation(finalOrder, finalGaps, e, sA, sB);
-      if (r.devInfinity) continue;
-      if (
-        r.dev < finalDev ||
-        (r.dev === finalDev && (r.s < finalS || (r.s === finalS && e < finalEdge)))
-      ) {
-        finalDev = r.dev;
-        finalEdge = e;
-        finalS = r.s;
-        finalTimes = r.times;
-      }
-    }
-    if (finalEdge < 0) {
+
+        // Lower-bound prune. The deviation bound (placed windows plus the
+        // independent remainders) is certified by phase B's Dstar: nothing
+        // strictly above it can be reported. Against the incumbent, the
+        // surviving pause interval (or the request range while the pause is
+        // unplaced) bounds the achievable duration, and the earliest
+        // still-available edge bounds the carrying position; exact ties never
+        // displace the incumbent, so they prune as well.
+        let placedLB = 0;
+        for (let k = 0; k < depth; k++) {
+          if (envLoArr[k]) {
+            const lo = Math.max(envLoArr[k]!.Q, envLoArr[k]!.P + sLoArr[k]);
+            const hi = Math.min(envHiArr[k]!.T, envHiArr[k]!.R + sHiArr[k]);
+            placedLB += minDeviation2(lo, hi, packets[orderArr[k]].mid2);
+          } else {
+            placedLB += minDeviation2(tLoArr[k], tHiArr[k], packets[orderArr[k]].mid2);
+          }
+        }
+        const devLB = placedLB + independentDevLB(mask);
+        if (devLB > Dstar) return;
+        const inc = bestD;
+        if (inc !== null && devLB === inc.dev) {
+          const sLB = fr.kind === 'param' ? fr.sLo : Dlo;
+          if (sLB > inc.s) return;
+          if (sLB === inc.s) {
+            const eLB = dormEdge >= 0 ? dormEdge : depth - 1;
+            if (eLB >= inc.edge) return;
+          }
+        }
+
+        const remaining = full ^ mask;
+        const target = finalOrder[depth];
+        for (const mv of enumerateMoves(depth, last, S, c0lo, c0hi, fr, mask)) {
+          if (mv.j !== target) continue;
+          if (S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] > Pstar) continue;
+          orderArr[depth] = mv.j;
+          gapsArr[depth - 1] = mv.d;
+          setPositionWindow(depth, mv.branch);
+          const nextDorm = mv.branch.kind === 'dorm' ? depth - 1 : dormEdge;
+          dfsD(
+            depth + 1,
+            mv.j,
+            S + mv.d,
+            mv.c0lo,
+            mv.c0hi,
+            frontierOf(mv.branch),
+            nextDorm,
+            mask | (1 << mv.j),
+          );
+        }
+      };
+
+      const seedD = packets[finalOrder[0]];
+      orderArr[0] = seedD.index;
+      tLoArr[0] = seedD.lo;
+      tHiArr[0] = seedD.hi;
+      envLoArr[0] = undefined;
+      envHiArr[0] = undefined;
+      dfsD(
+        1,
+        seedD.index,
+        0,
+        seedD.baseCount,
+        Math.min(seedD.topCount, countUpper - n + 1),
+        { kind: 'plain', tLo: seedD.lo, tHi: seedD.hi },
+        -1,
+        1 << seedD.index,
+      );
+      return bestD;
+    };
+
+    const decided = selectDormancyInterpretation();
+    if (decided === null) {
       // Defensive: phases A/B/C certified a pause-bearing optimal chain.
       throw new SolveError(
         'NO_CONSISTENT_INTERPRETATION',
         'internal failure selecting the dormancy edge',
       );
     }
+    finalEdge = decided.edge;
+    finalS = decided.s;
+    finalTimes = decided.times;
+    finalDev = decided.dev;
+    finalGaps = decided.gaps;
+    finalC0 = decided.c0;
   } else {
+    finalGaps = fixedGaps.slice();
+    finalC0 = curC0lo;
     const windows = tightenWindows(packets, finalOrder, finalGaps, minInterval, maxInterval);
     if (!windows) {
       throw new SolveError('NO_CONSISTENT_INTERPRETATION', 'internal failure tightening final windows');
@@ -1496,7 +1592,7 @@ export function solve(
       deviation2: finalDev,
       times: finalTimes,
       order: finalOrder,
-      c0: curC0lo,
+      c0: finalC0,
       gaps: finalGaps,
     },
     modulus,

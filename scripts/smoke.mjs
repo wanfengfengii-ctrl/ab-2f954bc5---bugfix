@@ -58,6 +58,30 @@ const dormancySample = {
   ],
 };
 
+/**
+ * Dormancy tie-break sample: counts [0,1,2,3,6,7] (pause 30 on adjacency 1)
+ * and [0,1,4,5,6,7] (pause 15 on adjacency 3) tie on missing count (2),
+ * midpoint deviation (0) and packet order; the shorter pause must win even
+ * though it belongs to a different absolute-counter assignment.
+ */
+const dormancyTieSample = {
+  modulus: 2,
+  countLower: 0,
+  countUpper: 7,
+  minInterval: 10,
+  maxInterval: 20,
+  dormancyLower: 1,
+  dormancyUpper: 50,
+  packets: [
+    { id: 4, remainder: 0, timeLower: 105, timeUpper: 105 },
+    { id: 1, remainder: 1, timeLower: 10, timeUpper: 10 },
+    { id: 5, remainder: 1, timeLower: 115, timeUpper: 115 },
+    { id: 0, remainder: 0, timeLower: 0, timeUpper: 0 },
+    { id: 3, remainder: 1, timeLower: 70, timeUpper: 70 },
+    { id: 2, remainder: 0, timeLower: 60, timeUpper: 60 },
+  ],
+};
+
 function fail(message) {
   console.error(`SMOKE FAILED: ${message}`);
   process.exit(1);
@@ -187,6 +211,48 @@ async function main() {
   const halfBody = await half.json();
   if (halfBody.error.code !== 'INVALID_REQUEST') fail('half dormancy bounds not INVALID_REQUEST');
 
+  // 7. Dormancy tie-break: among complete interpretations tied on the three
+  //    primary objectives, the shorter pause (then earlier edge) wins, even
+  //    when it belongs to a different absolute-counter assignment.
+  const tieRes = await fetch(`${baseUrl}/api/v1/recover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(dormancyTieSample),
+  });
+  if (tieRes.status !== 200) {
+    fail(`dormancy tie-break returned ${tieRes.status}: ${await tieRes.text()}`);
+  }
+  const tieBody = await tieRes.json();
+  if (tieBody.status !== 'ok') fail(`tie-break response not ok: ${JSON.stringify(tieBody)}`);
+  const td = tieBody.data;
+  if (JSON.stringify(td.order) !== JSON.stringify([0, 1, 2, 3, 4, 5])) {
+    fail(`tie-break wrong order: ${JSON.stringify(td.order)}`);
+  }
+  if (JSON.stringify(td.assignments.map((a) => a.absoluteCount)) !== JSON.stringify([0, 1, 4, 5, 6, 7])) {
+    fail(`tie-break wrong counts: ${JSON.stringify(td.assignments.map((a) => a.absoluteCount))}`);
+  }
+  if (td.missingCountTotal !== 2) fail(`tie-break wrong missing total: ${td.missingCountTotal}`);
+  if (!td.dormancy || td.dormancy.duration !== 15 || td.dormancy.adjacencyIndex !== 3) {
+    fail(`tie-break dormancy info wrong: ${JSON.stringify(td.dormancy)}`);
+  }
+  if (td.dormancy.fromId !== 3 || td.dormancy.toId !== 4) {
+    fail(`tie-break dormancy endpoints wrong: ${JSON.stringify(td.dormancy)}`);
+  }
+  const tieCarriers = td.adjacency.filter((e) => e.dormancy?.carriesDormancy);
+  if (tieCarriers.length !== 1 || tieCarriers[0].index !== 3) {
+    fail('tie-break expects exactly one carrying adjacency at index 3');
+  }
+  for (const ev of td.adjacency) {
+    if (!ev.satisfied) fail(`unsatisfied tie-break adjacency: ${JSON.stringify(ev)}`);
+    const pause = ev.dormancy?.carriesDormancy ? 15 : 0;
+    if (ev.allowedTimeGap.min !== ev.countGap * 10 + pause || ev.allowedTimeGap.max !== ev.countGap * 20 + pause) {
+      fail(`adjacency ${ev.index} allowed gap ignores the pause: ${JSON.stringify(ev.allowedTimeGap)}`);
+    }
+    if (ev.timeGap < ev.allowedTimeGap.min || ev.timeGap > ev.allowedTimeGap.max) {
+      fail(`adjacency ${ev.index} time gap ${ev.timeGap} outside allowed range`);
+    }
+  }
+
   console.log('SMOKE PASSED');
   console.log(`  order     : ${data.order.join(' -> ')}`);
   console.log(`  counts    : ${counts.join(', ')}`);
@@ -194,6 +260,9 @@ async function main() {
   console.log(`  adjacency : all ${data.adjacency.length} constraints satisfied`);
   console.log(
     `  dormancy  : ${dd.dormancy.duration} units between ${dd.dormancy.fromId} -> ${dd.dormancy.toId}`,
+  );
+  console.log(
+    `  tie-break : ${td.dormancy.duration} units between ${td.dormancy.fromId} -> ${td.dormancy.toId} (counts ${td.assignments.map((a) => a.absoluteCount).join(', ')})`,
   );
 }
 

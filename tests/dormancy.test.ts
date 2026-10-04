@@ -143,6 +143,83 @@ describe('solver: dormancy tie-breaks after the three original objectives', () =
     expect(r.dormancy?.fromId).toBe('p2');
     expect(r.dormancy?.toId).toBe('p3');
   });
+
+  it('compares the pause across tied counter assignments of the same order', () => {
+    // Counts [0,1,2,3,6,7] (pause 30 on edge 1) and [0,1,4,5,6,7] (pause 15
+    // on edge 3) tie on missing count (2), midpoint deviation (0) and the id
+    // sequence [0..5]; the shorter pause must win even though it belongs to a
+    // different absolute-counter assignment.
+    const packets: PacketInput[] = [0, 10, 60, 70, 105, 115].map((t, i) => ({
+      id: i,
+      remainder: i % 2,
+      timeLower: t,
+      timeUpper: t,
+    }));
+    const r = solve(packets, 2, 0, 7, 10, 20, { lower: 1, upper: 50 });
+    expect(r.order).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(r.missingCountTotal).toBe(2);
+    expect(r.assignments.map((a) => a.absoluteCount)).toEqual([0, 1, 4, 5, 6, 7]);
+    expect(r.assignments.map((a) => a.time)).toEqual([0, 10, 60, 70, 105, 115]);
+    expect(r.observedCountRange).toEqual({ first: 0, last: 7 });
+    expect(r.missingSegments).toEqual([{ fromCount: 2, toCount: 3, length: 2 }]);
+    expect(r.dormancy).toEqual({
+      duration: 15,
+      adjacencyIndex: 3,
+      fromPosition: 3,
+      toPosition: 4,
+      fromId: 3,
+      toId: 4,
+      range: { lower: 1, upper: 50 },
+    });
+    // Assignments, the dormancy record and the per-adjacency evidence must
+    // jointly describe this single interpretation.
+    expect(r.adjacency).toHaveLength(5);
+    for (const ev of r.adjacency) {
+      expect(ev.satisfied).toBe(true);
+      expect(ev.fromCount).toBe(r.assignments[ev.index].absoluteCount);
+      expect(ev.toCount).toBe(r.assignments[ev.index + 1].absoluteCount);
+      expect(ev.fromId).toBe(r.assignments[ev.index].id);
+      expect(ev.toId).toBe(r.assignments[ev.index + 1].id);
+      expect(ev.timeGap).toBe(ev.toTime - ev.fromTime);
+      expect(ev.timeGap).toBeGreaterThanOrEqual(ev.allowedTimeGap.min);
+      expect(ev.timeGap).toBeLessThanOrEqual(ev.allowedTimeGap.max);
+      if (ev.index === 3) {
+        expect(ev.dormancy).toEqual({ duration: 15, carriesDormancy: true });
+        expect(ev.allowedTimeGap).toEqual({ min: 25, max: 35 });
+        expect(ev.timeGap).toBe(35);
+      } else {
+        expect(ev.dormancy).toEqual({ duration: 0, carriesDormancy: false });
+      }
+    }
+    expect(r.adjacency.filter((e) => e.dormancy?.carriesDormancy)).toHaveLength(1);
+
+    // Download order is meaningless: scrambling the input must not change
+    // the selected interpretation.
+    const shuffled = [...packets].reverse();
+    expect(solve(shuffled, 2, 0, 7, 10, 20, { lower: 1, upper: 50 })).toEqual(r);
+  });
+
+  it('keeps the missing-count objective exact when a larger gap completes cheaper', () => {
+    // Elastic cadence 3..9 with a pause range of [12,32]. The primary-optimal
+    // chain (missing 6) reaches packet 4 through a gap-1 pause edge; a
+    // completion bound computed for a different successor must not prune it.
+    const packets: PacketInput[] = [
+      { id: 2, remainder: 0, timeLower: 31, timeUpper: 37 },
+      { id: 6, remainder: 1, timeLower: 128, timeUpper: 134 },
+      { id: 3, remainder: 1, timeLower: 46, timeUpper: 52 },
+      { id: 4, remainder: 0, timeLower: 77, timeUpper: 83 },
+      { id: 0, remainder: 1, timeLower: -2, timeUpper: 4 },
+      { id: 5, remainder: 1, timeLower: 104, timeUpper: 110 },
+      { id: 1, remainder: 1, timeLower: 10, timeUpper: 16 },
+    ];
+    const r = solve(packets, 2, 0, 21, 3, 9, { lower: 12, upper: 32 });
+    expect(r.order).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(r.missingCountTotal).toBe(6);
+    expect(r.assignments.map((a) => a.absoluteCount)).toEqual([1, 3, 6, 7, 8, 11, 13]);
+    expect(r.observedCountRange).toEqual({ first: 1, last: 13 });
+    expect(r.dormancy).toMatchObject({ duration: 28, adjacencyIndex: 3, fromId: 3, toId: 4 });
+    for (const ev of r.adjacency) expect(ev.satisfied).toBe(true);
+  });
 });
 
 describe('solver: dormancy failure evidence dispositions', () => {
@@ -218,11 +295,12 @@ describe('solver: wide dormancy intervals via the symbolic breakpoint path', () 
 });
 
 describe('solver: dormancy differential fuzzing against exhaustive reference', () => {
-  const batches: [number, number, 'fixed' | 'wide' | 'elastic'][] = [
+  const batches: [number, number, 'fixed' | 'wide' | 'elastic' | 'tied'][] = [
     [11, 18, 'fixed'],
     [77, 18, 'fixed'],
     [303, 8, 'wide'],
     [512, 8, 'elastic'],
+    [1000, 20, 'tied'],
   ];
 
   for (const [seedStart, count, mode] of batches) {
@@ -230,7 +308,11 @@ describe('solver: dormancy differential fuzzing against exhaustive reference', (
       const rnd = makeRng(seedStart);
       for (let iter = 0; iter < count; iter++) {
         const n = 6;
-        const modulus = 4 + Math.floor(rnd() * 4); // 4..7
+        // 'tied' batches use small moduli, wider cadence bands and missing
+        // counters in the ground truth so that many absolute-counter
+        // assignments tie on the three primary objectives.
+        const modulus =
+          mode === 'tied' ? 2 + Math.floor(rnd() * 2) : 4 + Math.floor(rnd() * 4);
         let minInterval: number;
         let maxInterval: number;
         let halfWidth: number;
@@ -238,6 +320,10 @@ describe('solver: dormancy differential fuzzing against exhaustive reference', (
           minInterval = 2 + Math.floor(rnd() * 3);
           maxInterval = minInterval + 1 + Math.floor(rnd() * 2);
           halfWidth = rnd() < 0.7 ? 0 : 1;
+        } else if (mode === 'tied') {
+          minInterval = 2 + Math.floor(rnd() * 6);
+          maxInterval = minInterval + 1 + Math.floor(rnd() * 8);
+          halfWidth = rnd() < 0.6 ? 0 : 1 + Math.floor(rnd() * 2);
         } else {
           minInterval = maxInterval = 2 + Math.floor(rnd() * 3);
           halfWidth = mode === 'wide' ? 0 : rnd() < 0.6 ? 0 : 1;
@@ -249,13 +335,17 @@ describe('solver: dormancy differential fuzzing against exhaustive reference', (
         for (let i = 0; i < n; i++) {
           counts.push(c);
           c += 1;
+          if (mode === 'tied' && rnd() < 0.3) c += 1 + Math.floor(rnd() * 2);
         }
         const countLower = 0;
-        const countUpper = counts[n - 1] + 1 + Math.floor(rnd() * 2);
+        const countUpper =
+          mode === 'tied'
+            ? counts[n - 1] + Math.floor(rnd() * 4)
+            : counts[n - 1] + 1 + Math.floor(rnd() * 2);
 
         const hasSleep = rnd() < 0.55;
         const sleepEdge = Math.floor(rnd() * (n - 1));
-        const sleep = 1 + Math.floor(rnd() * 5);
+        const sleep = 1 + Math.floor(rnd() * (mode === 'tied' ? 20 : 5));
         const timesTruth: number[] = [];
         let t = Math.floor(rnd() * 3);
         for (let i = 0; i < n; i++) {
@@ -266,7 +356,9 @@ describe('solver: dormancy differential fuzzing against exhaustive reference', (
               minInterval === maxInterval
                 ? minInterval
                 : minInterval + Math.floor(rnd() * (maxInterval - minInterval + 1));
-            t += step + (hasSleep && i === sleepEdge ? sleep : 0);
+            t +=
+              step * (mode === 'tied' ? counts[i + 1] - counts[i] : 1) +
+              (hasSleep && i === sleepEdge ? sleep : 0);
           }
         }
 
@@ -285,6 +377,8 @@ describe('solver: dormancy differential fuzzing against exhaustive reference', (
         let dRange: { lower: number; upper: number };
         if (!hasSleep) {
           dRange = { lower: 1, upper: 2 + Math.floor(rnd() * 2) };
+        } else if (mode === 'tied') {
+          dRange = { lower: Math.max(1, sleep - 8), upper: sleep + 12 };
         } else {
           const pick = rnd();
           if (mode === 'wide') {

@@ -187,6 +187,65 @@ async function main() {
   const halfBody = await half.json();
   if (halfBody.error.code !== 'INVALID_REQUEST') fail('half dormancy bounds not INVALID_REQUEST');
 
+  // 7. Tied dormancy interpretations: counts [0,1,2,3,6,7] (pause 30 on
+  //    adjacency 1) and counts [0,1,4,5,6,7] (pause 15 on adjacency 3) tie
+  //    on all three primary objectives (2 missing, deviation 0, order
+  //    0..5); the shorter pause on the alternative count assignment must
+  //    win, and every response section must describe that one interpretation.
+  const tiedSample = {
+    modulus: 2,
+    countLower: 0,
+    countUpper: 7,
+    minInterval: 10,
+    maxInterval: 20,
+    dormancyLower: 1,
+    dormancyUpper: 50,
+    packets: [0, 10, 60, 70, 105, 115].map((t, i) => ({
+      id: i,
+      remainder: i % 2,
+      timeLower: t,
+      timeUpper: t,
+    })),
+  };
+  const tiedRes = await fetch(`${baseUrl}/api/v1/recover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(tiedSample),
+  });
+  if (tiedRes.status !== 200) {
+    fail(`tied dormancy recovery returned ${tiedRes.status}: ${await tiedRes.text()}`);
+  }
+  const tiedBody = await tiedRes.json();
+  if (tiedBody.status !== 'ok') fail(`tied dormancy response not ok: ${JSON.stringify(tiedBody)}`);
+  const td = tiedBody.data;
+  if (JSON.stringify(td.order) !== JSON.stringify([0, 1, 2, 3, 4, 5])) {
+    fail(`tied dormancy wrong order: ${JSON.stringify(td.order)}`);
+  }
+  if (JSON.stringify(td.assignments.map((a) => a.absoluteCount)) !== JSON.stringify([0, 1, 4, 5, 6, 7])) {
+    fail(`tied dormancy wrong counts: ${JSON.stringify(td.assignments.map((a) => a.absoluteCount))}`);
+  }
+  if (td.missingCountTotal !== 2) fail(`tied dormancy wrong missing total: ${td.missingCountTotal}`);
+  if (!td.dormancy || td.dormancy.duration !== 15 || td.dormancy.adjacencyIndex !== 3) {
+    fail(`tied dormancy info wrong: ${JSON.stringify(td.dormancy)}`);
+  }
+  if (td.dormancy.fromId !== 3 || td.dormancy.toId !== 4) {
+    fail(`tied dormancy endpoints wrong: ${JSON.stringify(td.dormancy)}`);
+  }
+  const tiedCarriers = td.adjacency.filter((e) => e.dormancy?.carriesDormancy);
+  if (tiedCarriers.length !== 1 || tiedCarriers[0].index !== 3) {
+    fail(`tied dormancy carrier wrong: ${JSON.stringify(td.adjacency)}`);
+  }
+  for (const ev of td.adjacency) {
+    if (!ev.satisfied) fail(`unsatisfied tied dormancy adjacency: ${JSON.stringify(ev)}`);
+    const pause = ev.dormancy?.carriesDormancy ? 15 : 0;
+    if (ev.allowedTimeGap.min !== ev.countGap * 10 + pause || ev.allowedTimeGap.max !== ev.countGap * 20 + pause) {
+      fail(`adjacency ${ev.index} allowed gap excludes the pause: ${JSON.stringify(ev.allowedTimeGap)}`);
+    }
+    if (ev.timeGap < ev.allowedTimeGap.min || ev.timeGap > ev.allowedTimeGap.max) {
+      fail(`adjacency ${ev.index} time gap ${ev.timeGap} outside allowed range`);
+    }
+  }
+
   console.log('SMOKE PASSED');
   console.log(`  order     : ${data.order.join(' -> ')}`);
   console.log(`  counts    : ${counts.join(', ')}`);
@@ -194,6 +253,10 @@ async function main() {
   console.log(`  adjacency : all ${data.adjacency.length} constraints satisfied`);
   console.log(
     `  dormancy  : ${dd.dormancy.duration} units between ${dd.dormancy.fromId} -> ${dd.dormancy.toId}`,
+  );
+  console.log(
+    `  tied pause: ${td.dormancy.duration} units between ${td.dormancy.fromId} -> ${td.dormancy.toId} ` +
+      `(counts ${td.assignments.map((a) => a.absoluteCount).join(', ')})`,
   );
 }
 

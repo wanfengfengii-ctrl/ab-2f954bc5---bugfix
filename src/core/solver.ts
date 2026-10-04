@@ -308,7 +308,8 @@ interface Move {
  * space: A minimizes total counter gap; B minimizes midpoint deviation on
  * primary-optimal chains (also choosing s); C greedily fixes the
  * lexicographically smallest id sequence with a memoized feasibility oracle;
- * a final pass selects the pause duration and carrying edge.
+ * D (dormancy only) re-enumerates every count assignment of the fixed order
+ * and selects the pause duration and carrying edge across all tied chains.
  *
  * Throws SolveError(NO_CONSISTENT_INTERPRETATION) with first-failure evidence.
  */
@@ -748,7 +749,10 @@ export function solve(
 
     let best = Infinity;
     for (const mv of moves) {
-      if (Number.isFinite(bestA) && S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] >= bestA) break;
+      // Bound-prune THIS move only: moves are ordered by gap, but the
+      // Held-Karp completion bound varies with the target packet, so a
+      // later move may still beat the incumbent (no `break` is sound here).
+      if (Number.isFinite(bestA) && S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] >= bestA) continue;
       used[mv.j] = 1;
       orderArr[depth] = mv.j;
       gapsArr[depth - 1] = mv.d;
@@ -1413,70 +1417,117 @@ export function solve(
 
   // Assemble the certified chain: smallest admissible c0.
   const finalOrder = chosen.slice();
-  const finalGaps = fixedGaps.slice();
+  let finalGaps = fixedGaps.slice();
+  let finalC0 = curC0lo;
 
-  // Pick the carrying edge and duration. Counts and the id sequence are
-  // fixed; evaluate every edge position and prefer (deviation, duration,
-  // edge index) lexicographically. Without dormancy the edge stays unused.
+  // Pick the carrying edge and duration. Without dormancy the edge stays
+  // unused and phase C's certified chain is evaluated directly.
   let finalEdge = -1;
   let finalS = 0;
   let finalTimes: number[] = [];
   let finalDev = Infinity;
 
   if (dormEnabled) {
-    // Independent forward time windows for the fixed chain (no pause): the
-    // pause onset at edge e starts from packet e's plain tightened window.
-    const fwdLo = new Array<number>(n);
-    const fwdHi = new Array<number>(n);
-    fwdLo[0] = packets[finalOrder[0]].lo;
-    fwdHi[0] = packets[finalOrder[0]].hi;
-    for (let k = 1; k < n; k++) {
-      const p = packets[finalOrder[k]];
-      fwdLo[k] = Math.max(p.lo, fwdLo[k - 1] + finalGaps[k - 1] * minInterval);
-      fwdHi[k] = Math.min(p.hi, fwdHi[k - 1] + finalGaps[k - 1] * maxInterval);
+    // ---------------------------------------------------------------- Phase D
+    // The id sequence is fixed, but the closing tie-breaks (shorter pause,
+    // then earlier carrying edge) range over EVERY absolute-count assignment
+    // consistent with the three primary objectives for this order: phase C's
+    // greedy gap choices must not pre-empt a tied chain whose pause is
+    // shorter or carried earlier. DFS over the fixed order's gap choices
+    // with the same frontier machinery as phases A-C; each admissible leaf
+    // evaluates its exact (deviation, duration) optimum and the search keeps
+    // the lexicographically smallest (deviation, duration, carrying edge).
+    //
+    // Suffix lower bounds on the remaining counter-gap sum along the fixed
+    // order, for exact-sum pruning (the total must stay Pstar).
+    const suffixMin = new Array<number>(n + 1).fill(0);
+    for (let e = n - 2; e >= 0; e--) {
+      suffixMin[e] = suffixMin[e + 1] + minGap[finalOrder[e]][finalOrder[e + 1]];
     }
 
-    for (let e = 0; e < n - 1; e++) {
-      if (fwdLo[e] > fwdHi[e]) continue;
-      const pNext = packets[finalOrder[e + 1]];
-      const d = finalGaps[e];
-      let sA = Math.max(Dlo, pNext.lo - fwdHi[e] - d * maxInterval);
-      let sB = Math.min(Dhi, pNext.hi - fwdLo[e] - d * minInterval);
-      if (sA > sB) continue;
-      let envLo: Env = { P: fwdLo[e] + d * minInterval, Q: pNext.lo, R: 0, T: 0 };
-      let envHi: Env = { P: 0, Q: 0, R: fwdHi[e] + d * maxInterval, T: pNext.hi };
-      let feasible = true;
-      for (let k = e + 2; k < n; k++) {
-        const ext = extendParam(envLo, envHi, sA, sB, finalGaps[k - 1], packets[finalOrder[k]]);
-        if (!ext) {
-          feasible = false;
-          break;
+    let bestGaps: number[] | null = null;
+    let bestC0 = 0;
+
+    const dfsD = (
+      depth: number,
+      S: number,
+      c0lo: number,
+      c0hi: number,
+      fr: Frontier,
+      dormEdge: number,
+      mask: number,
+    ): void => {
+      if (depth === n) {
+        if (S !== Pstar || !leafAdmissible(fr, dormEdge)) return;
+        const r = bestLeafDeviation(
+          finalOrder,
+          gapsArr.slice(0, n - 1),
+          dormEdge,
+          sLoArr[n - 1],
+          sHiArr[n - 1],
+        );
+        if (r.devInfinity) return;
+        if (
+          r.dev < finalDev ||
+          (r.dev === finalDev && (r.s < finalS || (r.s === finalS && dormEdge < finalEdge)))
+        ) {
+          finalDev = r.dev;
+          finalS = r.s;
+          finalEdge = dormEdge;
+          finalTimes = r.times;
+          bestGaps = gapsArr.slice(0, n - 1);
+          bestC0 = c0lo;
         }
-        envLo = ext.envLo;
-        envHi = ext.envHi;
-        sA = ext.sLo;
-        sB = ext.sHi;
+        return;
       }
-      if (!feasible) continue;
-      const r = bestLeafDeviation(finalOrder, finalGaps, e, sA, sB);
-      if (r.devInfinity) continue;
-      if (
-        r.dev < finalDev ||
-        (r.dev === finalDev && (r.s < finalS || (r.s === finalS && e < finalEdge)))
-      ) {
-        finalDev = r.dev;
-        finalEdge = e;
-        finalS = r.s;
-        finalTimes = r.times;
+      // Exact-sum prune: even the cheapest completion of the fixed order
+      // from here must not overshoot the primary optimum.
+      if (S + suffixMin[depth - 1] > Pstar) return;
+      const want = finalOrder[depth];
+      const remaining = full ^ mask;
+      const moves = enumerateMoves(depth, finalOrder[depth - 1], S, c0lo, c0hi, fr, mask);
+      for (const mv of moves) {
+        if (mv.j !== want) continue;
+        if (S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] > Pstar) continue;
+        gapsArr[depth - 1] = mv.d;
+        setPositionWindow(depth, mv.branch);
+        const nextDorm = mv.branch.kind === 'dorm' ? depth - 1 : dormEdge;
+        dfsD(
+          depth + 1,
+          S + mv.d,
+          mv.c0lo,
+          mv.c0hi,
+          frontierOf(mv.branch),
+          nextDorm,
+          mask | (1 << mv.j),
+        );
       }
-    }
-    if (finalEdge < 0) {
+    };
+
+    const seedD = packets[finalOrder[0]];
+    for (let k = 0; k < n; k++) orderArr[k] = finalOrder[k];
+    envLoArr.fill(undefined);
+    envHiArr.fill(undefined);
+    tLoArr[0] = seedD.lo;
+    tHiArr[0] = seedD.hi;
+    dfsD(
+      1,
+      0,
+      seedD.baseCount,
+      Math.min(seedD.topCount, countUpper - n + 1),
+      { kind: 'plain', tLo: seedD.lo, tHi: seedD.hi },
+      -1,
+      1 << seedD.index,
+    );
+    if (bestGaps === null) {
       // Defensive: phases A/B/C certified a pause-bearing optimal chain.
       throw new SolveError(
         'NO_CONSISTENT_INTERPRETATION',
         'internal failure selecting the dormancy edge',
       );
     }
+    finalGaps = bestGaps;
+    finalC0 = bestC0;
   } else {
     const windows = tightenWindows(packets, finalOrder, finalGaps, minInterval, maxInterval);
     if (!windows) {
@@ -1496,7 +1547,7 @@ export function solve(
       deviation2: finalDev,
       times: finalTimes,
       order: finalOrder,
-      c0: curC0lo,
+      c0: finalC0,
       gaps: finalGaps,
     },
     modulus,

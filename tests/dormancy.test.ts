@@ -143,6 +143,72 @@ describe('solver: dormancy tie-breaks after the three original objectives', () =
     expect(r.dormancy?.fromId).toBe('p2');
     expect(r.dormancy?.toId).toBe('p3');
   });
+
+  it('prefers a shorter pause on a tied chain with a different count assignment', () => {
+    // Two complete interpretations tie on all three primary objectives
+    // (2 missing, deviation 0, order 0..5): counts [0,1,2,3,6,7] need a
+    // 30-unit pause on adjacency 1, while counts [0,1,4,5,6,7] only need 15
+    // on adjacency 3. The shorter pause must win even though the greedy
+    // gap choice reaches the 30-unit chain first.
+    const packets: PacketInput[] = [0, 10, 60, 70, 105, 115].map((t, i) => ({
+      id: i,
+      remainder: i % 2,
+      timeLower: t,
+      timeUpper: t,
+    }));
+    const r = solve(packets, 2, 0, 7, 10, 20, { lower: 1, upper: 50 });
+    expect(r.missingCountTotal).toBe(2);
+    expect(r.order).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(r.assignments.map((a) => a.absoluteCount)).toEqual([0, 1, 4, 5, 6, 7]);
+    expect(r.assignments.map((a) => a.time)).toEqual([0, 10, 60, 70, 105, 115]);
+    expect(r.dormancy).toEqual({
+      duration: 15,
+      adjacencyIndex: 3,
+      fromPosition: 3,
+      toPosition: 4,
+      fromId: 3,
+      toId: 4,
+      range: { lower: 1, upper: 50 },
+    });
+    expect(r.missingSegments).toEqual([{ fromCount: 2, toCount: 3, length: 2 }]);
+    expect(r.observedCountRange).toEqual({ first: 0, last: 7 });
+    expect(r.adjacency).toHaveLength(5);
+    for (const ev of r.adjacency) {
+      expect(ev.satisfied).toBe(true);
+      if (ev.index === 3) {
+        expect(ev.dormancy).toEqual({ duration: 15, carriesDormancy: true });
+        expect(ev.allowedTimeGap).toEqual({ min: 25, max: 35 });
+        expect(ev.timeGap).toBe(35);
+      } else {
+        expect(ev.dormancy).toEqual({ duration: 0, carriesDormancy: false });
+      }
+    }
+    expect(r.adjacency.filter((e) => e.dormancy?.carriesDormancy)).toHaveLength(1);
+  });
+
+  it('does not let an early heavy-bound move hide the primary optimum', () => {
+    // Regression: phase A's move loop used to `break` on the first move
+    // whose Held-Karp completion bound reached the incumbent. Moves are
+    // ordered by counter gap, but the bound varies with the target packet —
+    // here the gap-2 move toward packet 3 has an infinite bound and would
+    // hide the gap-3 move that leads to the true optimum (2 missing, pause
+    // of 25 on adjacency 2).
+    const packets: PacketInput[] = [
+      { id: 2, remainder: 0, timeLower: 30, timeUpper: 30 },
+      { id: 5, remainder: 1, timeLower: 76, timeUpper: 76 },
+      { id: 4, remainder: 0, timeLower: 73, timeUpper: 73 },
+      { id: 0, remainder: 0, timeLower: 4, timeUpper: 4 },
+      { id: 3, remainder: 1, timeLower: 64, timeUpper: 64 },
+      { id: 1, remainder: 1, timeLower: 9, timeUpper: 9 },
+    ];
+    const r = solve(packets, 2, 0, 10, 2, 9, { lower: 1, upper: 42 });
+    expect(r.missingCountTotal).toBe(2);
+    expect(r.order).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(r.assignments.map((a) => a.absoluteCount)).toEqual([0, 1, 4, 5, 6, 7]);
+    expect(r.dormancy?.duration).toBe(25);
+    expect(r.dormancy?.adjacencyIndex).toBe(2);
+    for (const ev of r.adjacency) expect(ev.satisfied).toBe(true);
+  });
 });
 
 describe('solver: dormancy failure evidence dispositions', () => {
